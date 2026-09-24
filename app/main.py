@@ -29,9 +29,11 @@ from .schemas import (
     PaymentCreate,
     PaymentOverview,
     PaymentResult,
+    PaymentSnapshot,
     ReversalCreate,
     ReversalResult,
     parse_iso_date,
+    parse_utc_second,
 )
 
 
@@ -45,13 +47,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
         "收款冲销（分次冲销、按净入账额计算余额）、"
         "一笔来款在多张同币种待结发票间按到期日顺序分配、"
-        "到期日（due_date）与逾期发票分页查询，SQLite 持久化。"
+        "到期日（due_date）与逾期发票分页查询、"
+        "单张发票指定 UTC 时点的历史收款快照（截止秒闭区间），SQLite 持久化。"
     ),
     lifespan=lifespan,
 )
@@ -321,6 +324,35 @@ def read_payments(
     if row is None:
         raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
     return database.payment_overview(conn, row)
+
+
+@app.get(
+    "/api/v1/invoices/{invoice_id}/payment-snapshot",
+    response_model=PaymentSnapshot,
+    tags=["payments"],
+)
+def read_payment_snapshot(
+    invoice_id: int,
+    at: str = Query(
+        ...,
+        description="历史快照截止时点，必填，UTC 秒精度（YYYY-MM-DDTHH:MM:SSZ）；"
+        "截止秒为闭区间，同秒的收款与冲销全部计入",
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """单张发票在指定 UTC 时点的历史收款快照。
+
+    只统计 ``created_at <= at``（含当秒）的收款与对应冲销，按发票币种最小
+    单位用 Decimal 计算收款总额、冲销总额、净已收与未收余额；截止后的流水
+    不参与，历史结果可重复复现。发票不存在返回 404；时间格式错误或时点早于
+    发票创建时间返回 422（均走全局 ValueError -> 422 处理器）。
+    """
+
+    row = database.get_invoice(conn, invoice_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
+    cutoff = parse_utc_second(at, "at")
+    return database.payment_snapshot(conn, row, cutoff)
 
 
 @app.post(

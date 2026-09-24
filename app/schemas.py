@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _DECIMAL_RE = re.compile(r"^-?\d+(\.\d+)?$|^-?\.\d+$")
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_UTC_SECOND_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 def parse_iso_date(value: str, field: str = "日期") -> date:
@@ -26,6 +27,29 @@ def parse_iso_date(value: str, field: str = "日期") -> date:
         return date.fromisoformat(text)
     except ValueError as exc:
         raise ValueError(f"{field} 不是合法日期（YYYY-MM-DD），收到 {value!r}") from exc
+
+
+def parse_utc_second(value: str, field: str = "at") -> datetime:
+    """严格解析 UTC 秒精度时间 ``YYYY-MM-DDTHH:MM:SSZ``。
+
+    只接受这一种形状：必须带 ``T`` 分隔符与 ``Z`` 后缀、秒精度（拒绝
+    ``+00:00`` 偏移、带毫秒/微秒、空格分隔等变体），且日期/时间必须真实存在
+    （拒绝 ``2026-13-01T00:00:00Z``、``2026-02-30T00:00:00Z`` 等）。
+    失败抛 ``ValueError``（API 层映射为 422），成功返回 UTC 感知时间（秒精度）。
+    """
+
+    text = value.strip()
+    if not _ISO_UTC_SECOND_RE.match(text):
+        raise ValueError(
+            f"{field} 必须是 UTC 秒精度时间（YYYY-MM-DDTHH:MM:SSZ），收到 {value!r}"
+        )
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise ValueError(
+            f"{field} 不是合法的 UTC 秒精度时间（YYYY-MM-DDTHH:MM:SSZ），收到 {value!r}"
+        ) from exc
+    return parsed.replace(tzinfo=timezone.utc)
 
 
 class LineIn(BaseModel):
@@ -288,6 +312,59 @@ class PaymentOverview(BaseModel):
     outstanding: str
     payment_count: int
     payments: list[PaymentOut]
+
+
+# ---- 历史收款快照 ----
+
+
+class SnapshotPaymentOut(BaseModel):
+    """快照中一笔计入截止时点的收款流水（含当秒）。"""
+
+    model_config = ConfigDict(extra="allow")
+    id: int
+    invoice_id: int
+    amount: str
+    currency: str
+    created_at: str
+    reversed_total: str
+    net_amount: str
+
+
+class SnapshotReversalOut(BaseModel):
+    """快照中一笔计入截止时点的冲销流水（含当秒，须关联快照时点已存在的收款）。"""
+
+    model_config = ConfigDict(extra="allow")
+    id: int
+    payment_id: int
+    invoice_id: int
+    amount: str
+    currency: str
+    created_at: str
+
+
+class PaymentSnapshot(BaseModel):
+    """单张发票在指定 UTC 时点的历史收款快照。
+
+    只统计 ``created_at <= at``（截止秒为闭区间，同秒流水全部计入）的收款与
+    对应冲销；截止后写入的任何流水都不改变历史结果。所有金额按发票币种最小
+    单位用 Decimal 计算，``net_paid = received_total - reversed_total``，
+    ``outstanding = total_gross - net_paid``。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    invoice_id: int
+    currency: str
+    at: str
+    invoice_created_at: str
+    total_gross: str
+    received_total: str
+    reversed_total: str
+    net_paid: str
+    outstanding: str
+    payment_count: int
+    reversal_count: int
+    payments: list[SnapshotPaymentOut]
+    reversals: list[SnapshotReversalOut]
 
 
 # ---- 收款冲销 ----

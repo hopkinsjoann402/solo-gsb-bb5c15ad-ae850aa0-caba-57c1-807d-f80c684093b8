@@ -10,6 +10,7 @@
 - **收款冲销**：`POST /api/v1/payments/{payment_id}/reversals` 对已登记的收款流水冲销（可同一笔分次冲销，累计不得超过原收款）；冲销记录单独持久化、不删除原收款，未收余额、逾期查询与后续来款分配一律按**净入账额**（收款 − 冲销）计算，累计校验与写入在同一 SQLite 写事务内完成，并发冲销不会超额。
 - **来款分配**：传入币种、金额字符串与待结发票 ID 列表，把一笔来款按**到期日升序（未设置到期日排最后）、同日按 ID 升序**逐张抵扣；只处理列表内发票，不做跨币种换算。金额必须是币种最小单位的正整数倍；列表重复、发票不存在、币种不符或总未收不足时**整笔拒绝、不留下部分收款**。每张被抵扣的发票沿用同一条 `payments` 流水，单张收款查询与逾期查询均可见。
 - **到期日与逾期查询**：创建发票时可选填 ISO 日期 `due_date`；`GET /api/v1/invoices/overdue` 按截止日（可选 `as_of`，缺省取 UTC 当前日期）分页返回**已到期且未收余额大于零**的发票，含币种与精确（Decimal）未收余额。
+- **历史收款快照**：`GET /api/v1/invoices/{id}/payment-snapshot?at=...` 返回单张发票在指定 UTC 时点（必填、秒精度 `YYYY-MM-DDTHH:MM:SSZ`，截止秒为闭区间、同秒流水全部计入）的收款总额、冲销总额、净已收与未收余额；只统计该时点之前及当秒的流水，截止后的流水不改变历史结果，金额全程按发票币种最小单位用 `Decimal` 计算。
 - **SQLite 持久化**（WAL 模式），提供创建、按 id 查询、分页列表、健康检查。
 - 内置 OpenAPI 交互文档（Swagger UI / ReDoc）。
 
@@ -81,6 +82,9 @@ curl -s -X POST http://localhost:8000/api/v1/payment-allocations \
 
 # 查询已逾期且仍有未收余额的发票（as_of 缺省取 UTC 当前日期）
 curl -s 'http://localhost:8000/api/v1/invoices/overdue?page=1&page_size=20&as_of=2026-10-15'
+
+# 查询发票 1 在指定 UTC 时点的历史收款快照（at 必填，秒精度，截止秒含同秒流水）
+curl -s 'http://localhost:8000/api/v1/invoices/1/payment-snapshot?at=2026-10-15T12:00:00Z'
 ```
 
 > 以上命令要求服务已启动：在仓库根目录执行 `docker compose up -d --build`（见下一节）。
@@ -173,6 +177,7 @@ Base URL：`http://localhost:8000`（本地先用 Docker Compose 启动：
 | `GET` | `/api/v1/invoices/overdue` | 逾期发票分页查询（按 id 倒序），支持 `page`、`page_size`、可选 `as_of` |
 | `POST` | `/api/v1/invoices/{id}/payments` | 登记一笔收款（发票币种字符串、必须大于 0），`201` |
 | `GET` | `/api/v1/invoices/{id}/payments` | 查询该发票的收款记录（含各流水已冲销金额与净入账额）与未收余额 |
+| `GET` | `/api/v1/invoices/{id}/payment-snapshot?at=...` | 单张发票在指定 UTC 时点（必填、秒精度）的历史收款快照：收款/冲销总额、净已收与未收余额 |
 | `POST` | `/api/v1/payments/{payment_id}/reversals` | 冲销一笔收款（可分次，累计不超过原收款），`201` |
 | `POST` | `/api/v1/payment-allocations` | 一笔来款在多张待结发票间按到期日顺序分配，`201` |
 | `GET` | `/docs` `/redoc` `/openapi.json` | 交互式 API 文档 |
@@ -403,7 +408,65 @@ curl -s 'http://localhost:8000/api/v1/invoices/overdue'
 
 无逾期发票时 `items` 为空、`total`/`pages` 为 `0`。
 
-### 3.6 来款分配 `POST /api/v1/payment-allocations`
+### 3.6 历史收款快照 `GET /api/v1/invoices/{id}/payment-snapshot`
+
+查询单张发票在**指定 UTC 时点**的历史收款情况，常用于对账、审计与「某时点账龄」回放。
+
+查询参数：
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `at` | string | 是 | 快照截止时点，UTC **秒精度**时间 `YYYY-MM-DDTHH:MM:SSZ`（如 `2026-10-15T12:00:00Z`）；只接受这一种形状（`+00:00` 偏移、带毫秒、空格分隔、日期/时间不存在均返回 `422`） |
+
+统计口径：
+
+1. **截止秒为闭区间**：收款与冲销均按各自的登记时间 `created_at <= at` 筛选，
+   截止当秒写入的流水**全部计入**。
+2. 分别统计：该时点之前及当秒的**收款总额** `received_total`，以及这些收款
+   对应的**冲销总额** `reversed_total`（冲销按其自身登记时间独立过滤）。
+3. **净已收** `net_paid = received_total − reversed_total`；
+   **未收余额** `outstanding = total_gross − net_paid`。
+   全程按发票币种最小单位用 `Decimal` 计算（USD/CNY 保留 2 位、JPY 为整数、KWD 3 位）。
+4. 查询只读历史行：**截止时点之后写入的任何收款/冲销都不参与，历史结果不会
+   随后续流水改变**——对同一 `at` 重复查询结果恒定。
+5. 时点早于发票创建时间（`invoice_created_at`）返回 `422`；发票不存在返回 `404`。
+
+响应同时回显纳入快照的收款（每条带当点口径的 `reversed_total`/`net_amount`）
+与冲销明细及各自计数，便于审计核对。
+
+```bash
+curl -s 'http://localhost:8000/api/v1/invoices/1/payment-snapshot?at=2026-10-15T12:00:00Z'
+```
+
+```json
+{
+  "invoice_id": 1,
+  "currency": "USD",
+  "at": "2026-10-15T12:00:00Z",
+  "invoice_created_at": "2026-09-23T01:40:00Z",
+  "total_gross": "33.11",
+  "received_total": "20.00",
+  "reversed_total": "5.00",
+  "net_paid": "15.00",
+  "outstanding": "18.11",
+  "payment_count": 1,
+  "reversal_count": 1,
+  "payments": [
+    {"id": 1, "invoice_id": 1, "amount": "20.00", "currency": "USD",
+     "created_at": "2026-10-01T08:00:00Z",
+     "reversed_total": "5.00", "net_amount": "15.00"}
+  ],
+  "reversals": [
+    {"id": 1, "payment_id": 1, "invoice_id": 1, "amount": "5.00",
+     "currency": "USD", "created_at": "2026-10-05T09:30:00Z"}
+  ]
+}
+```
+
+JPY 等 0 位小数币种的快照金额同样不带小数位（如 `"received_total": "1000"`、
+`"reversed_total": "600"`、`"net_paid": "400"`、`"outstanding": "600"`）。
+
+### 3.7 来款分配 `POST /api/v1/payment-allocations`
 
 把一笔来款在**多张同币种待结发票**间按到期日顺序逐张抵扣。
 
@@ -472,12 +535,12 @@ curl -s -X POST http://localhost:8000/api/v1/payment-allocations \
   因此 `GET /api/v1/invoices/{id}/payments` 与逾期分页查询都能看到分配结果，
   与单张收款登记完全一致。
 
-### 3.7 错误码
+### 3.8 错误码
 
 | 状态码 | 场景 |
 | --- | --- |
-| `404` | 发票 id 不存在（含单张收款登记/查询、来款分配时列表中任一 id 不存在）；冲销时收款流水 `payment_id` 不存在 |
-| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款/来款/冲销金额 ≤ 0、金额小于币种最小单位、累计收款或列表总未收不足、累计冲销超过原收款、来款列表为空或 ID 重复、来款与发票币种不一致、`due_date` / `as_of` 不是合法 ISO 日期、分页参数越界等（响应体 `detail` 为中文说明） |
+| `404` | 发票 id 不存在（含单张收款登记/查询、历史快照、来款分配时列表中任一 id 不存在）；冲销时收款流水 `payment_id` 不存在 |
+| `422` | 参数错误：金额非十进制字符串、净额不满足最小单位、税率越界、跨币种缺汇率、未知币种、收款/来款/冲销金额 ≤ 0、金额小于币种最小单位、累计收款或列表总未收不足、累计冲销超过原收款、来款列表为空或 ID 重复、来款与发票币种不一致、`due_date` / `as_of` 不是合法 ISO 日期、历史快照的 `at` 缺失或不是合法 UTC 秒精度时间（`YYYY-MM-DDTHH:MM:SSZ`）或早于发票创建时间、分页参数越界等（响应体 `detail` 为中文说明） |
 
 ---
 
@@ -520,7 +583,8 @@ python -m unittest tests.test_calc -v
 # API 端到端（自动在空闲端口起真实 uvicorn：健康检查、增查、分页、收款登记/余额、
 # 超额 422 不留记录、并发不超收、due_date 持久化、逾期分页/422、
 # 来款分配排序/整笔拒绝/分配与单张收款混合并发不超收、
-# 收款冲销分次/超额 422 不留记录/并发冲销不超额/冲销后余额回升再分配、持久化）
+# 收款冲销分次/超额 422 不留记录/并发冲销不超额/冲销后余额回升再分配、
+# 历史收款快照（截止秒闭区间/同秒流水/截止后流水不改变历史/格式与早于发票创建 422/404）、持久化）
 python -m unittest tests.test_api -v
 ```
 
@@ -531,14 +595,14 @@ python -m unittest tests.test_api -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 逾期查询 / 单张收款 / 收款冲销 / 来款分配
+│   ├── main.py        # FastAPI 路由：健康检查 / 创建 / 查询 / 分页 / 逾期查询 / 单张收款 / 历史收款快照 / 收款冲销 / 来款分配
 │   ├── calc.py        # Decimal 计算核心：HALF_UP + 最大余数法残差分配（纯函数）
 │   ├── currency.py    # ISO 4217 币种最小单位表 + CURRENCY_DIGITS 扩展
-│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期 / 冲销 / 来款分配模型）
-│   └── db.py          # SQLite 建表（含旧库迁移）/ 事务写入（发票 + 收款 + 冲销 + 来款分配）/ 查询（含逾期，WAL）
+│   ├── schemas.py     # Pydantic 入参/出参模型（金额一律字符串，含 due_date / 逾期 / 冲销 / 来款分配 / 历史快照模型）
+│   └── db.py          # SQLite 建表（含旧库迁移）/ 事务写入（发票 + 收款 + 冲销 + 来款分配）/ 查询（含逾期与历史快照，WAL）
 ├── tests/
 │   ├── test_calc.py   # 20 个计算规则单测
-│   └── test_api.py    # 真实 HTTP 端到端测试（含收款/冲销/来款分配并发不超收不超额、到期日与逾期查询）
+│   └── test_api.py    # 真实 HTTP 端到端测试（含收款/冲销/来款分配并发不超收不超额、到期日与逾期查询、历史收款快照）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
