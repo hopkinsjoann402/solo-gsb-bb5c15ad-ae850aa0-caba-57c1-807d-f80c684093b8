@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _DECIMAL_RE = re.compile(r"^-?\d+(\.\d+)?$|^-?\.\d+$")
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_UTC_SECOND_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_UTC_SECOND_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def parse_iso_date(value: str, field: str = "日期") -> date:
@@ -26,6 +28,40 @@ def parse_iso_date(value: str, field: str = "日期") -> date:
         return date.fromisoformat(text)
     except ValueError as exc:
         raise ValueError(f"{field} 不是合法日期（YYYY-MM-DD），收到 {value!r}") from exc
+
+
+def parse_utc_second(value: str, field: str = "at") -> datetime:
+    """严格解析 UTC **秒精度**时间（``YYYY-MM-DDTHH:MM:SSZ``）。
+
+    只接受字面 ``Z`` 结尾、无毫秒/微秒/时区偏移的 UTC 秒精度形状；
+    不存在的日期/时间（如 ``2026-02-30T12:00:00Z``、``2026-09-23T24:00:00Z``）
+    同样拒绝。返回时区感知的 UTC ``datetime``；失败抛 ``ValueError``
+    （API 层映射为 422）。
+    """
+
+    text = value.strip()
+    if not _UTC_SECOND_RE.match(text):
+        raise ValueError(
+            f"{field} 必须是 UTC 秒精度时间（YYYY-MM-DDTHH:MM:SSZ），收到 {value!r}"
+        )
+    try:
+        parsed = datetime.strptime(text, _UTC_SECOND_FMT)
+    except ValueError as exc:
+        raise ValueError(
+            f"{field} 不是合法的 UTC 秒精度时间（YYYY-MM-DDTHH:MM:SSZ），收到 {value!r}"
+        ) from exc
+    return parsed.replace(tzinfo=timezone.utc)
+
+
+def format_utc_second(value: datetime) -> str:
+    """时区感知 datetime -> 规范化的 UTC 秒精度字符串（``...Z``，无小数秒）。"""
+
+    return (
+        value.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 class LineIn(BaseModel):
@@ -344,3 +380,54 @@ class PagedOverdueInvoices(BaseModel):
     total: int
     pages: int
     as_of: str
+
+
+# ---- 历史收款快照 ----
+
+
+class SnapshotPaymentOut(BaseModel):
+    """快照时点已登记（且在截止时点之前/当秒）的收款流水。"""
+
+    model_config = ConfigDict(extra="allow")
+    id: int
+    invoice_id: int
+    amount: str
+    currency: str
+    created_at: str
+    # 截止时点前该流水已发生的冲销合计（注意：可能小于当前实时值）
+    reversed_total: str
+    # 截止时点的净入账额 = amount − 截止时点的 reversed_total
+    net_amount: str
+
+
+class SnapshotReversalOut(BaseModel):
+    """快照时点之前/当秒已发生的冲销流水。"""
+
+    model_config = ConfigDict(extra="allow")
+    id: int
+    payment_id: int
+    amount: str
+    created_at: str
+
+
+class PaymentSnapshot(BaseModel):
+    """单张发票在某个历史时点（UTC 秒精度，截止秒闭区间）的收款快照。
+
+    只统计 ``created_at <= at`` 的收款与对应冲销；截止时点之后登记的流水
+    不参与计算，因此同一历史时点的结果不会随后续收款/冲销改变。
+    """
+
+    model_config = ConfigDict(extra="allow")
+    invoice_id: int
+    currency: str
+    at: str
+    invoice_created_at: str
+    total_gross: str
+    paid_total: str        # 收款总额（截止时点前/当秒收款的毛额合计）
+    reversed_total: str    # 冲销总额（截止时点前/当秒冲销合计）
+    net_paid: str          # 净已收 = paid_total − reversed_total
+    outstanding: str       # 未收余额 = total_gross − net_paid
+    payment_count: int
+    reversal_count: int
+    payments: list[SnapshotPaymentOut]
+    reversals: list[SnapshotReversalOut]

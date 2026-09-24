@@ -621,6 +621,109 @@ def allocate_payment(
     }
 
 
+def payment_snapshot(
+    conn: sqlite3.Connection, invoice: sqlite3.Row, at: datetime
+) -> dict[str, Any]:
+    """某张发票在历史时点 ``at``（UTC，秒精度，**截止秒闭区间**）的收款快照。
+
+    分别筛选 ``created_at <= at`` 的收款与冲销：
+
+    * 收款：该发票 ``payments.created_at <= at`` 的流水（截止秒同秒全部计入）；
+    * 冲销：``payment_reversals`` 中，既关联上述收款、自身 ``created_at <= at``
+      的记录（即“对应冲销”；截止秒之后才发生的冲销不计入历史结果）。
+
+    金额在 Python 侧用 ``Decimal`` 逐笔求和（不走 SQLite 浮点聚合），并按发票
+    币种最小单位规范化；返回收款总额、冲销总额、净已收与未收余额，以及两条
+    流水明细（均带登记时间，便于审计同秒边界）。快照只做历史统计，不写库，
+    因此截止时点之后的任何流水都不会改变结果。
+    """
+
+    cutoff = at.astimezone(timezone.utc).replace(microsecond=0)
+    cutoff_text = cutoff.isoformat().replace("+00:00", "Z")
+
+    payment_rows = list(
+        conn.execute(
+            "SELECT * FROM payments WHERE invoice_id = ? AND created_at <= ? ORDER BY id",
+            (invoice["id"], cutoff_text),
+        ).fetchall()
+    )
+    payment_ids = [int(r["id"]) for r in payment_rows]
+
+    reversal_rows: list[sqlite3.Row] = []
+    if payment_ids:
+        placeholders = ",".join("?" for _ in payment_ids)
+        # JOIN payments：只取属于“截止时点前已登记的收款”的冲销；
+        # 同时要求冲销自身也在截止时点之前/当秒
+        reversal_rows = list(
+            conn.execute(
+                "SELECT r.* FROM payment_reversals r"
+                " JOIN payments p ON p.id = r.payment_id"
+                f" WHERE r.payment_id IN ({placeholders})"
+                " AND p.invoice_id = ? AND r.created_at <= ?"
+                " ORDER BY r.id",
+                (*payment_ids, invoice["id"], cutoff_text),
+            ).fetchall()
+        )
+
+    reversed_by_payment: dict[int, Decimal] = {}
+    for r in reversal_rows:
+        pid = int(r["payment_id"])
+        reversed_by_payment[pid] = reversed_by_payment.get(pid, Decimal("0")) + Decimal(
+            r["amount"]
+        )
+
+    unit = _minor_unit(int(invoice["currency_digits"]))
+    gross = Decimal(invoice["total_gross"])
+    paid_total = Decimal("0")
+    reversed_total = Decimal("0")
+    payments: list[dict[str, Any]] = []
+    for r in payment_rows:
+        rev = reversed_by_payment.get(int(r["id"]), Decimal("0")).quantize(unit)
+        net = Decimal(r["amount"]) - rev
+        paid_total += Decimal(r["amount"])
+        reversed_total += rev
+        payments.append(
+            {
+                "id": r["id"],
+                "invoice_id": r["invoice_id"],
+                "amount": r["amount"],
+                "currency": r["currency"],
+                "created_at": r["created_at"],
+                "reversed_total": format(rev, "f"),
+                "net_amount": format(net, "f"),
+            }
+        )
+    paid_total = paid_total.quantize(unit)
+    reversed_total = reversed_total.quantize(unit)
+    net_paid = (paid_total - reversed_total).quantize(unit)
+
+    reversals = [
+        {
+            "id": r["id"],
+            "payment_id": r["payment_id"],
+            "amount": r["amount"],
+            "created_at": r["created_at"],
+        }
+        for r in reversal_rows
+    ]
+
+    return {
+        "invoice_id": invoice["id"],
+        "currency": invoice["currency"],
+        "at": cutoff_text,
+        "invoice_created_at": invoice["created_at"],
+        "total_gross": invoice["total_gross"],
+        "paid_total": format(paid_total, "f"),
+        "reversed_total": format(reversed_total, "f"),
+        "net_paid": format(net_paid, "f"),
+        "outstanding": format(gross - net_paid, "f"),
+        "payment_count": len(payment_rows),
+        "reversal_count": len(reversal_rows),
+        "payments": payments,
+        "reversals": reversals,
+    }
+
+
 def payment_overview(conn: sqlite3.Connection, invoice: sqlite3.Row) -> dict[str, Any]:
     """某张发票的收款记录与未收余额（供 GET 使用）。
 

@@ -29,9 +29,12 @@ from .schemas import (
     PaymentCreate,
     PaymentOverview,
     PaymentResult,
+    PaymentSnapshot,
     ReversalCreate,
     ReversalResult,
+    format_utc_second,
     parse_iso_date,
+    parse_utc_second,
 )
 
 
@@ -45,13 +48,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
         "收款冲销（分次冲销、按净入账额计算余额）、"
         "一笔来款在多张同币种待结发票间按到期日顺序分配、"
-        "到期日（due_date）与逾期发票分页查询，SQLite 持久化。"
+        "到期日（due_date）与逾期发票分页查询、"
+        "单张发票历史收款快照（按 UTC 秒精度时点回放收款与冲销），SQLite 持久化。"
     ),
     lifespan=lifespan,
 )
@@ -321,6 +325,46 @@ def read_payments(
     if row is None:
         raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
     return database.payment_overview(conn, row)
+
+
+@app.get(
+    "/api/v1/invoices/{invoice_id}/payment-snapshot",
+    response_model=PaymentSnapshot,
+    tags=["payments"],
+)
+def read_payment_snapshot(
+    invoice_id: int,
+    at: str = Query(
+        ...,
+        description="历史时点，UTC 秒精度（YYYY-MM-DDTHH:MM:SSZ），"
+        "截止秒为闭区间：该秒内登记的收款/冲销全部计入",
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """单张发票在历史时点 ``at`` 的收款快照。
+
+    只回放 ``created_at <= at`` 的收款及其对应冲销（当秒流水全部包含），
+    按发票币种最小单位用 Decimal 计算收款总额、冲销总额、净已收与未收余额；
+    截止时点之后的流水不参与计算，同一历史时点的结果恒定。发票不存在 -> 404；
+    时间格式错误或时点早于发票创建时间 -> 422。
+    """
+
+    # 先查发票：不存在的资源返回 404（优先于时点参数的 422）
+    row = database.get_invoice(conn, invoice_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
+
+    # 非法时间形状走全局 ValueError -> 422 处理器
+    cutoff = parse_utc_second(at, "at")
+
+    # 同样用 UTC 秒精度口径比较（created_at 即 utc_now_iso() 写入的 Z 秒精度字符串）
+    if format_utc_second(cutoff) < row["created_at"]:
+        # 走全局 ValueError -> 422 处理器
+        raise ValueError(
+            f"at 不得早于发票创建时间 {row['created_at']}，收到 {at!r}"
+        )
+
+    return database.payment_snapshot(conn, row, cutoff)
 
 
 @app.post(

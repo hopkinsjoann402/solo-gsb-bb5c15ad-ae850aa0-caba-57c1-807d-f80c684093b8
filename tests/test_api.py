@@ -967,6 +967,247 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(ov["paid_total"], "2.00")
         self.assertEqual(ov["outstanding"], "18.00")
 
+    def test_19_payment_snapshot(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        def parse_ts(ts: str) -> datetime:
+            return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+
+        def sleep_past(ts: str) -> str:
+            """阻塞到 ts 所在秒的下一钞 pad 秒后，返回 ts 本身。
+
+            随后登记的流水其 created_at 必严格晚于 ts，因此 ts 已是封闭的历史秒
+            （同秒闭区间下，不能在“当前正在发生的秒”上做排除断言）。
+            """
+
+            target = parse_ts(ts) + timedelta(seconds=1) + timedelta(seconds=0.25)
+            now = datetime.now(timezone.utc)
+            if now < target:
+                time.sleep((target - now).total_seconds())
+            return ts
+
+        def snapshot(invoice_id: int, at: str):
+            return self._request(
+                "GET", f"/api/v1/invoices/{invoice_id}/payment-snapshot?at={at}"
+            )
+
+        # 发票 total_gross = 33.11
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "USD",
+                "lines": [
+                    {"net": "10.05", "tax_rate": "0.10"},
+                    {"net": "20.05", "tax_rate": "0.10"},
+                ],
+            },
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        created_at = inv["created_at"]
+        self.assertRegex(created_at, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        t0 = created_at
+
+        # 发票创建当秒：空快照，未收 = 含税总额
+        status, snap = snapshot(invoice_id, t0)
+        self.assertEqual(status, 200, snap)
+        self.assertEqual(snap["at"], t0)
+        self.assertEqual(snap["invoice_created_at"], created_at)
+        self.assertEqual(snap["currency"], "USD")
+        self.assertEqual(snap["total_gross"], "33.11")
+        self.assertEqual(snap["paid_total"], "0.00")
+        self.assertEqual(snap["reversed_total"], "0.00")
+        self.assertEqual(snap["net_paid"], "0.00")
+        self.assertEqual(snap["outstanding"], "33.11")
+        self.assertEqual(snap["payment_count"], 0)
+        self.assertEqual(snap["reversal_count"], 0)
+        self.assertEqual(snap["payments"], [])
+        self.assertEqual(snap["reversals"], [])
+
+        # t1：跨过创建秒后登记收款 20.00，当秒快照立即包含该流水
+        sleep_past(t0)
+        status, pay = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "20.00"}
+        )
+        self.assertEqual(status, 201, pay)
+        payment_id = pay["id"]
+        t1 = pay["created_at"]
+        self.assertGreater(t1, t0)
+        status, snap = snapshot(invoice_id, t1)
+        self.assertEqual(status, 200, snap)
+        self.assertEqual(snap["paid_total"], "20.00")
+        self.assertEqual(snap["reversed_total"], "0.00")
+        self.assertEqual(snap["net_paid"], "20.00")
+        self.assertEqual(snap["outstanding"], "13.11")
+        self.assertEqual(snap["payment_count"], 1)
+        self.assertEqual(snap["reversal_count"], 0)
+        self.assertEqual(snap["payments"][0]["amount"], "20.00")
+        self.assertEqual(snap["payments"][0]["reversed_total"], "0.00")
+        self.assertEqual(snap["payments"][0]["net_amount"], "20.00")
+        # 创建秒的历史快照不包含这笔收款
+        status, before = snapshot(invoice_id, t0)
+        self.assertEqual(status, 200)
+        self.assertEqual(before["payment_count"], 0)
+        self.assertEqual(before["paid_total"], "0.00")
+        self.assertEqual(before["outstanding"], "33.11")
+
+        # t2：跨过 t1 秒后登记第二笔收款 13.11（收满）
+        sleep_past(t1)
+        status, pay2 = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "13.11"}
+        )
+        self.assertEqual(status, 201, pay2)
+        t2 = pay2["created_at"]
+        self.assertGreater(t2, t1)
+        status, snap = snapshot(invoice_id, t2)
+        self.assertEqual(snap["paid_total"], "33.11")
+        self.assertEqual(snap["net_paid"], "33.11")
+        self.assertEqual(snap["outstanding"], "0.00")
+        self.assertEqual(snap["payment_count"], 2)
+
+        # t3：跨过 t2 秒后冲销第一笔收款 5.00
+        sleep_past(t2)
+        status, rev = self._request(
+            "POST", f"/api/v1/payments/{payment_id}/reversals", {"amount": "5.00"}
+        )
+        self.assertEqual(status, 201, rev)
+        t3 = rev["created_at"]
+        self.assertGreater(t3, t2)
+        status, snap = snapshot(invoice_id, t3)
+        self.assertEqual(status, 200, snap)
+        self.assertEqual(snap["paid_total"], "33.11")
+        self.assertEqual(snap["reversed_total"], "5.00")
+        self.assertEqual(snap["net_paid"], "28.11")
+        self.assertEqual(snap["outstanding"], "5.00")
+        self.assertEqual(snap["reversal_count"], 1)
+        self.assertEqual(snap["reversals"][0]["payment_id"], payment_id)
+        self.assertEqual(snap["reversals"][0]["amount"], "5.00")
+        p1 = {p["id"]: p for p in snap["payments"]}[payment_id]
+        self.assertEqual(p1["reversed_total"], "5.00")
+        self.assertEqual(p1["net_amount"], "15.00")
+
+        # t4：跨过 t3 秒后再冲 3.00（分次冲销）
+        sleep_past(t3)
+        status, rev2 = self._request(
+            "POST", f"/api/v1/payments/{payment_id}/reversals", {"amount": "3.00"}
+        )
+        self.assertEqual(status, 201, rev2)
+        t4 = rev2["created_at"]
+        self.assertGreater(t4, t3)
+        status, snap = snapshot(invoice_id, t4)
+        self.assertEqual(snap["reversed_total"], "8.00")
+        self.assertEqual(snap["net_paid"], "25.11")
+        self.assertEqual(snap["outstanding"], "8.00")
+        self.assertEqual(snap["reversal_count"], 2)
+
+        # ---- 历史不可变：截止后的流水不得改变历史结果 ----
+        status, hist_t0 = snapshot(invoice_id, t0)
+        self.assertEqual(status, 200)
+        self.assertEqual(hist_t0["payment_count"], 0)
+        self.assertEqual(hist_t0["paid_total"], "0.00")
+        self.assertEqual(hist_t0["reversed_total"], "0.00")
+        self.assertEqual(hist_t0["net_paid"], "0.00")
+        self.assertEqual(hist_t0["outstanding"], "33.11")
+        status, hist_t1 = snapshot(invoice_id, t1)
+        self.assertEqual(hist_t1["payment_count"], 1)
+        self.assertEqual(hist_t1["paid_total"], "20.00")
+        self.assertEqual(hist_t1["reversed_total"], "0.00")
+        self.assertEqual(hist_t1["net_paid"], "20.00")
+        self.assertEqual(hist_t1["outstanding"], "13.11")
+        status, hist_t2 = snapshot(invoice_id, t2)
+        self.assertEqual(hist_t2["payment_count"], 2)
+        self.assertEqual(hist_t2["reversed_total"], "0.00")
+        self.assertEqual(hist_t2["net_paid"], "33.11")
+        status, hist_t3 = snapshot(invoice_id, t3)
+        self.assertEqual(hist_t3["reversal_count"], 1)
+        self.assertEqual(hist_t3["reversed_total"], "5.00")
+        self.assertEqual(hist_t3["net_paid"], "28.11")
+        # 同一历史时点重复查询结果一致
+        status, hist_t3_again = snapshot(invoice_id, t3)
+        self.assertEqual(hist_t3, hist_t3_again)
+
+        # ---- 错误码 ----
+        # 发票不存在 -> 404（即使 at 合法也按资源不存在判定）
+        status, body = snapshot(999999, t4)
+        self.assertEqual(status, 404)
+        self.assertIn("detail", body)
+
+        # at 格式错误 -> 422
+        for bad in (
+            "2026-09-23",
+            "2026-09-23T01:02:03",
+            "2026-09-23T01:02:03+00:00",
+            "2026-09-23T01:02:03.123Z",
+            "2026/09/23T01:02:03Z",
+            "2026-13-01T00:00:00Z",
+            "2026-02-30T00:00:00Z",
+            "2026-09-23T24:00:00Z",
+            "not-a-time",
+        ):
+            status, resp = snapshot(invoice_id, bad)
+            self.assertEqual(status, 422, bad)
+            self.assertIn("detail", resp)
+
+        # at 缺失 -> 422
+        status, resp = self._request(
+            "GET", f"/api/v1/invoices/{invoice_id}/payment-snapshot"
+        )
+        self.assertEqual(status, 422)
+
+        # at 早于发票创建时间 -> 422（恰好等于创建时间是允许的，前面已验证）
+        earlier = (parse_ts(created_at) - timedelta(seconds=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        status, resp = snapshot(invoice_id, earlier)
+        self.assertEqual(status, 422)
+        self.assertIn(created_at, resp["detail"])
+
+    def test_20_payment_snapshot_jpy(self) -> None:
+        # 0 位小数币种：金额字符串不带小数位，快照口径一致
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "JPY", "lines": [{"net": "1000", "tax_rate": "0"}]},
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        self.assertEqual(inv["totals"]["total_gross"], "1000")
+
+        status, pay = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "600"}
+        )
+        self.assertEqual(status, 201, pay)
+        t_pay = pay["created_at"]
+        status, rev = self._request(
+            "POST", f"/api/v1/payments/{pay['id']}/reversals", {"amount": "200"}
+        )
+        self.assertEqual(status, 201, rev)
+        t_rev = rev["created_at"]
+
+        # 收款当钞：毛额 600，无冲销
+        status, snap = self._request(
+            "GET", f"/api/v1/invoices/{invoice_id}/payment-snapshot?at={t_pay}"
+        )
+        self.assertEqual(status, 200, snap)
+        self.assertEqual(snap["paid_total"], "600")
+        self.assertEqual(snap["reversed_total"], "0")
+        self.assertEqual(snap["net_paid"], "600")
+        self.assertEqual(snap["outstanding"], "400")
+        self.assertNotIn(".", snap["outstanding"])
+
+        # 冲销当钞：净已收 400，未收回升为 600
+        status, snap = self._request(
+            "GET", f"/api/v1/invoices/{invoice_id}/payment-snapshot?at={t_rev}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(snap["paid_total"], "600")
+        self.assertEqual(snap["reversed_total"], "200")
+        self.assertEqual(snap["net_paid"], "400")
+        self.assertEqual(snap["outstanding"], "600")
+
 
 if __name__ == "__main__":
     unittest.main()
